@@ -60,7 +60,7 @@ def clear_result_cache():
     _RESULT_CACHE.clear()
 
 
-@UniHelper.with_reaction
+# @UniHelper.with_reaction
 async def parser_handler(
     sr: SearchResult = Searched(),
 ):

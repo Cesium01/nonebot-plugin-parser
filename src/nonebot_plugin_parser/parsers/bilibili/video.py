@@ -77,23 +77,23 @@ class VideoInfo(Struct):
         """
         # 定义需要展示的数据及其显示名称
         stats_mapping = [
-            ("👍", self.stat.like),
-            ("🪙", self.stat.coin),
-            ("⭐", self.stat.favorite),
-            ("↩️", self.stat.share),
-            ("💬", self.stat.reply),
-            ("👀", self.stat.view),
-            ("💭", self.stat.danmaku),
+            ("点赞", self.stat.like),
+            ("硬币", self.stat.coin),
+            ("收藏", self.stat.favorite),
+            ("分享", self.stat.share),
+            ("评论", self.stat.reply),
+            ("播放", self.stat.view),
+            ("弹幕", self.stat.danmaku),
         ]
 
         # 构建结果字符串
         result_parts = []
         for display_name, value in stats_mapping:
             # 数值超过10000时转换为万为单位
-            formatted_value = f"{value / 10000:.1f}万" if value > 10000 else str(value)
-            result_parts.append(f"{display_name} {formatted_value}")
+            formatted_value = f"{value / 10000:.2f}万" if value > 10000 else str(value)
+            result_parts.append(f"{display_name}: {formatted_value}")
 
-        return " ".join(result_parts)
+        return "|".join(result_parts)
 
     def extract_info_with_page(self, page_num: int = 1) -> PageInfo:
         """获取视频信息，包含页索引、标题、时长、封面

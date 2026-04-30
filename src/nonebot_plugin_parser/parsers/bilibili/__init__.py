@@ -158,7 +158,7 @@ class BilibiliParser(BaseParser):
             url=url,
             title=page_info.title,
             timestamp=page_info.timestamp,
-            text=video_info.desc,
+            text=f"{video_info.formatted_stats_info}/n{video_info.desc}",
             author=author,
             contents=[video_content],
             extra={"info": ai_summary},
