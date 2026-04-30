@@ -93,7 +93,7 @@ class VideoInfo(Struct):
             formatted_value = f"{value / 10000:.2f}万" if value > 10000 else str(value)
             result_parts.append(f"{display_name}: {formatted_value}")
 
-        return "|".join(result_parts)
+        return " | ".join(result_parts)
 
     def extract_info_with_page(self, page_num: int = 1) -> PageInfo:
         """获取视频信息，包含页索引、标题、时长、封面
