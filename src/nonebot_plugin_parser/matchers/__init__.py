@@ -4,6 +4,7 @@ from typing import TypeVar
 from nonebot import logger, get_driver, on_command
 from nonebot.params import CommandArg
 from nonebot.adapters import Message
+from nonebot_plugin_alconna import Video
 
 from .rule import SUPER_PRIVATE, Searched, SearchResult, on_keyword_regex
 from ..utils import LimitedSizeDict
@@ -80,14 +81,19 @@ async def parser_handler(
     # 3. 渲染内容消息并发送
     renderer = get_renderer(result.platform.name)(result)
     async for message in renderer.render_messages():
-        await message.send()
+        if message.has(Video):
+            file_id = await UniHelper.upload_video_via_stream(message)
+            if file_id:
+                await UniMessage(Video(id=file_id)).send()
+        else:
+            await message.send()
 
     # 4. 缓存解析结果
     _RESULT_CACHE[cache_key] = result
 
 
 @on_command("bm", priority=3, block=True).handle()
-@UniHelper.with_reaction
+# @UniHelper.with_reaction
 async def _(message: Message = CommandArg()):
     text = message.extract_plain_text()
     matched = re.search(r"(BV[A-Za-z0-9]{10})(\s\d{1,3})?", text)
@@ -118,7 +124,7 @@ if yt_dlp_downloader is not None:
     from ..parsers import YouTubeParser
 
     @on_command("ym", priority=3, block=True).handle()
-    @UniHelper.with_reaction
+    # @UniHelper.with_reaction
     async def _(message: Message = CommandArg()):
         text = message.extract_plain_text()
         parser = get_parser_by_type(YouTubeParser)

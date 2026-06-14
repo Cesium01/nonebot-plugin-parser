@@ -1,12 +1,13 @@
-from typing import Any, Literal
+import base64
+from io import BytesIO
+from typing import AsyncGenerator
 from pathlib import Path
-from functools import wraps
-from collections.abc import Callable, Sequence, Awaitable
+from collections.abc import Sequence
+import uuid
 
-from nonebot import logger
-from nonebot.matcher import current_bot, current_event
-from nonebot.adapters import Event
-from nonebot_plugin_alconna import SupportAdapter, uniseg
+import aiofiles
+from nonebot.matcher import current_bot
+from nonebot_plugin_alconna import SupportAdapter
 from nonebot_plugin_alconna.uniseg import (
     File,
     Text,
@@ -124,43 +125,41 @@ class UniHelper:
             return File(raw=file.read_bytes(), name=display_name)
         else:
             return File(path=file, name=display_name)
+        
+    @staticmethod
+    async def get_video_seg_stream(
+        seg: Video,
+        chunk_size: int = 1024 * 1024
+    ) -> AsyncGenerator[bytes, None]:
+        if seg.raw:
+            data: BytesIO = BytesIO(seg.raw) if isinstance(seg.raw, bytes) else seg.raw
+            while chunk := data.read(chunk_size):
+                yield chunk
+        elif seg.path:
+            async with aiofiles.open(seg.path, "rb") as f:
+                while chunk := await f.read(chunk_size):
+                    yield chunk
+        else:
+            yield b""
 
-    @classmethod
-    async def message_reaction(
-        cls,
-        event: Event,
-        status: Literal["fail", "resolving", "done"],
-    ) -> None:
-        """发送消息回应"""
-        message_id = uniseg.get_message_id(event)
-        target = uniseg.get_target(event)
-
-        emoji = EMOJI_MAP[status][0 if target.adapter in ID_ADAPTERS else 1]
-
-        try:
-            await uniseg.message_reaction(emoji, message_id=message_id)
-        except Exception:
-            logger.opt(exception=True).warning(f"reaction {emoji} to {message_id} failed, maybe not support")
-
-    @classmethod
-    def with_reaction(cls, func: Callable[..., Awaitable[Any]]):
-        """自动回应装饰器"""
-
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            event = current_event.get()
-            await cls.message_reaction(event, "resolving")
-
-            try:
-                result = await func(*args, **kwargs)
-            # except TipException as e:
-            #     await UniMessage.text(e.message).send()
-            #     raise
-            except Exception:
-                await cls.message_reaction(event, "fail")
-                raise
-
-            await cls.message_reaction(event, "done")
-            return result
-
-        return wrapper
+    @staticmethod
+    async def upload_video_via_stream(
+        msg: UniMessage[Video]
+    ) -> str:
+        """流式上传视频"""
+        bot = current_bot.get()
+        stream_id = str(uuid.uuid4())
+        chunk_index = 0
+        file_id = ""
+        async for chunk in UniHelper.get_video_seg_stream(msg[0]):
+            b64_data = base64.b64encode(chunk).decode("utf-8")
+            res = await bot.call_api(
+                "upload_file_stream",
+                stream_id=stream_id,
+                chunk_data=b64_data,
+                chunk_index=chunk_index
+            )
+            if res:
+                file_id = res.get("file") or res.get("file_id", "")
+            chunk_index += 1
+        return file_id
