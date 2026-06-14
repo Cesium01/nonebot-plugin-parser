@@ -1,13 +1,10 @@
 import base64
-from io import BytesIO
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 from pathlib import Path
 from collections.abc import Sequence
 import uuid
 
-import aiofiles
 from nonebot.matcher import current_bot
-from nonebot_plugin_alconna import SupportAdapter
 from nonebot_plugin_alconna.uniseg import (
     File,
     Text,
@@ -26,20 +23,6 @@ from .config import pconfig
 
 ForwardNodeInner = str | Segment | UniMessage
 """转发消息节点内部允许的类型"""
-
-EMOJI_MAP = {
-    "fail": ("10060", "❌"),
-    "resolving": ("424", "👀"),
-    "done": ("144", "🎉"),
-}
-"""emoji 映射"""
-
-ID_ADAPTERS = {
-    SupportAdapter.onebot11,
-    SupportAdapter.qq,
-    SupportAdapter.milky,
-}
-"""支持的传入 emoji id 发送 reaction 的适配器"""
 
 
 class UniHelper:
@@ -127,37 +110,51 @@ class UniHelper:
             return File(path=file, name=display_name)
         
     @staticmethod
-    async def get_video_seg_stream(
+    def get_chunk_info(
         seg: Video,
         chunk_size: int = 1024 * 1024
-    ) -> AsyncGenerator[bytes, None]:
+    ) -> dict[str, Any]:
         if seg.raw:
-            data: BytesIO = BytesIO(seg.raw) if isinstance(seg.raw, bytes) else seg.raw
-            while chunk := data.read(chunk_size):
-                yield chunk
+            data = seg.raw if isinstance(seg.raw, bytes) else seg.raw.read()
         elif seg.path:
-            async with aiofiles.open(seg.path, "rb") as f:
-                while chunk := await f.read(chunk_size):
-                    yield chunk
+            with open(seg.path, "rb") as f:
+                data = f.read()
         else:
-            yield b""
+            raise ValueError("empty video data")
+        return {
+            "data": data,
+            "file_size": len(data),
+            "total_chunks": len(data)+chunk_size-1 // chunk_size 
+        }
+        
+    @staticmethod
+    async def get_video_seg_stream(
+        data: bytes,
+        chunk_size: int = 1024 * 1024
+    ) -> AsyncGenerator[bytes, None]:
+        for i in range(0, len(data), chunk_size):
+            yield data[i:i + chunk_size]
 
     @staticmethod
     async def upload_video_via_stream(
-        msg: UniMessage[Video]
+        msg: UniMessage[Video],
+        chunk_size: int = 1024 * 1024
     ) -> str:
         """流式上传视频"""
         bot = current_bot.get()
         stream_id = str(uuid.uuid4())
         chunk_index = 0
         file_id = ""
-        async for chunk in UniHelper.get_video_seg_stream(msg[0]):
+        chunk_info = UniHelper.get_chunk_info(msg[0], chunk_size)
+        async for chunk in UniHelper.get_video_seg_stream(chunk_info["data"], chunk_size):
             b64_data = base64.b64encode(chunk).decode("utf-8")
             res = await bot.call_api(
                 "upload_file_stream",
                 stream_id=stream_id,
                 chunk_data=b64_data,
-                chunk_index=chunk_index
+                chunk_index=chunk_index,
+                total_chunks=chunk_info["total_chunks"],
+                file_size=chunk_info["file_size"]
             )
             if res:
                 file_id = res.get("file") or res.get("file_id", "")
