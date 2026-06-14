@@ -148,15 +148,20 @@ class UniHelper:
         chunk_info = UniHelper.get_chunk_info(msg[0], chunk_size)
         async for chunk in UniHelper.get_video_seg_stream(chunk_info["data"], chunk_size):
             b64_data = base64.b64encode(chunk).decode("utf-8")
-            res = await bot.call_api(
+            await bot.call_api(
                 "upload_file_stream",
                 stream_id=stream_id,
                 chunk_data=b64_data,
                 chunk_index=chunk_index,
                 total_chunks=chunk_info["total_chunks"],
-                file_size=chunk_info["file_size"],
-                is_complete= chunk_index+1==chunk_size
+                file_size=chunk_info["file_size"]
             )
             chunk_index += 1
-            logger.warning(res)
-        return stream_id
+            if chunk_index==chunk_size:
+                res = await bot.call_api(
+                    "upload_file_stream",
+                    stream_id=stream_id,
+                    is_complete=True
+                )
+                logger.warning(res)
+                return res.get("file_path", "")
