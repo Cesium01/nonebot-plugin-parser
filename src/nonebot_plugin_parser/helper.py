@@ -157,7 +157,7 @@ class UniHelper:
                 file_size=chunk_info["file_size"]
             )
             chunk_index += 1
-            if chunk_index==chunk_size:
+            if chunk_index==chunk_info["total_chunks"]:
                 res = await bot.call_api(
                     "upload_file_stream",
                     stream_id=stream_id,
