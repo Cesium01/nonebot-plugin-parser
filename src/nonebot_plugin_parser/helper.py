@@ -4,6 +4,7 @@ from pathlib import Path
 from collections.abc import Sequence
 import uuid
 
+from nonebot import logger
 from nonebot.matcher import current_bot
 from nonebot_plugin_alconna.uniseg import (
     File,
@@ -144,7 +145,6 @@ class UniHelper:
         bot = current_bot.get()
         stream_id = str(uuid.uuid4())
         chunk_index = 0
-        file_id = ""
         chunk_info = UniHelper.get_chunk_info(msg[0], chunk_size)
         async for chunk in UniHelper.get_video_seg_stream(chunk_info["data"], chunk_size):
             b64_data = base64.b64encode(chunk).decode("utf-8")
@@ -154,9 +154,9 @@ class UniHelper:
                 chunk_data=b64_data,
                 chunk_index=chunk_index,
                 total_chunks=chunk_info["total_chunks"],
-                file_size=chunk_info["file_size"]
+                file_size=chunk_info["file_size"],
+                is_complete= chunk_index+1==chunk_size
             )
-            if res:
-                file_id = res.get("file") or res.get("file_id", "")
             chunk_index += 1
-        return file_id
+            logger.warning(res)
+        return stream_id
