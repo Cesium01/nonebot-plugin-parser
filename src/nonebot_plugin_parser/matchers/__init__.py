@@ -83,7 +83,7 @@ async def parser_handler(
     async for message in renderer.render_messages():
         if message.has(Video):
             file_path = await UniHelper.upload_video_via_stream(message)
-            await UniMessage(Video(url=file_path)).send()
+            await UniMessage(Video(path=file_path)).send()
         else:
             await message.send()
 
