@@ -124,7 +124,7 @@ class UniHelper:
         return {
             "data": data,
             "file_size": len(data),
-            "total_chunks": len(data)+chunk_size-1 // chunk_size 
+            "total_chunks": (len(data)+chunk_size-1) // chunk_size
         }
         
     @staticmethod

@@ -85,6 +85,8 @@ async def parser_handler(
             file_id = await UniHelper.upload_video_via_stream(message)
             if file_id:
                 await UniMessage(Video(id=file_id)).send()
+            else:
+                logger.warning("got no file_id after upload")
         else:
             await message.send()
 
