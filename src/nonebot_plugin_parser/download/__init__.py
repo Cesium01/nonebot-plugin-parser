@@ -3,7 +3,7 @@ from pathlib import Path
 from functools import partial
 from contextlib import contextmanager
 from urllib.parse import urljoin
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import retry, stop_after_attempt, wait_none
 
 import httpx
 import aiofiles
@@ -68,7 +68,7 @@ class StreamDownloader:
 
         return content_length
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+    @retry(stop=stop_after_attempt(5), wait=wait_none())
     async def _download_file_with_httpx(
         self,
         url: str,
@@ -99,7 +99,7 @@ class StreamDownloader:
 
         return file_path
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+    @retry(stop=stop_after_attempt(5), wait=wait_none())
     async def _download_file_with_curl_cffi(
         self,
         url: str,
@@ -150,11 +150,11 @@ class StreamDownloader:
             path = await self._download_file_with_httpx(
                 url, file_path=file_path, headers=headers, chunk_size=chunk_size
             )
-        except httpx.HTTPError:
+        except Exception:
             logger.opt(exception=True).warning(f"下载失败(httpx) | url: {url}")
             try:
                 path = await self._download_file_with_curl_cffi(url, file_path=file_path, headers=headers)
-            except curl_cffi.CurlError:
+            except Exception:
                 logger.opt(exception=True).warning(f"下载失败(curl_cffi) | url: {url}")
                 raise DownloadException("媒体下载失败")
 
