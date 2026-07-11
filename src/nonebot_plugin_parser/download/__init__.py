@@ -26,7 +26,9 @@ class StreamDownloader:
     def __init__(self):
         self.headers: dict[str, str] = COMMON_HEADER.copy()
         self.cache_dir: Path = pconfig.cache_dir
-        self.client: httpx.AsyncClient = httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT, verify=False)
+        self.client: httpx.AsyncClient = httpx.AsyncClient(
+            timeout=DOWNLOAD_TIMEOUT, verify=False, proxy=pconfig.cnproxy or None
+        )
 
     async def aclose(self):
         await self.client.aclose()
@@ -108,6 +110,7 @@ class StreamDownloader:
                 headers=headers,
                 timeout=DOWNLOAD_TIMEOUT,
                 stream=True,
+                proxy=pconfig.cnproxy or None
             )
             response.raise_for_status()
             content_length = self._validate_content_length(response)

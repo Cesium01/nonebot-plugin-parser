@@ -219,6 +219,9 @@ parser_ytb_ck=""
 # 推特解析会自动读取环境变量中的 http_proxy / https_proxy(代理软件通常会自动设置)
 parser_proxy=None
 
+# [可选] 国内代理, 用于访问中国大陆网站
+parser_cn_proxy=None
+
 # [可选] 音频解析，是否需要上传群文件
 parser_need_upload=False
 
