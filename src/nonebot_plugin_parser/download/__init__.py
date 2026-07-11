@@ -53,16 +53,29 @@ class StreamDownloader:
     @staticmethod
     def _validate_content_length(
         response: httpx.Response | curl_cffi.Response,
+        existing_size: int = 0,
     ) -> int:
-        """获取文件长度"""
+        """获取文件长度，返回本次响应的字节长度。"""
         content_length = response.headers.get("Content-Length")
         content_length = int(content_length) if content_length else 0
+        total_length = 0
 
-        if content_length == 0:
+        if response.status_code == 206:
+            content_range = response.headers.get("Content-Range", "")
+            try:
+                total_length = int(content_range.split("/")[-1])
+            except (ValueError, IndexError):
+                total_length = existing_size + content_length
+            if content_length == 0 and total_length > existing_size:
+                content_length = total_length - existing_size
+        else:
+            total_length = content_length
+
+        if total_length == 0:
             logger.warning(f"媒体 url: {response.url}, 大小为 0, 取消下载")
             raise IgnoreException
 
-        if (file_size := content_length / 1024 / 1024) > pconfig.max_size:
+        if (file_size := total_length / 1024 / 1024) > pconfig.max_size:
             logger.warning(f"媒体 url: {response.url} 大小 {file_size:.2f} MB, 超过 {pconfig.max_size} MB, 取消下载")
             raise IgnoreException
 
@@ -78,6 +91,10 @@ class StreamDownloader:
         chunk_size: int = 64 * 1024,
     ) -> Path:
         """download file by url with stream"""
+        existing_size = file_path.stat().st_size if file_path.exists() else 0
+        headers = headers.copy()
+        if existing_size > 0:
+            headers["Range"] = f"bytes={existing_size}-"
 
         async with self.client.stream(
             "GET",
@@ -85,14 +102,29 @@ class StreamDownloader:
             headers=headers,
             follow_redirects=True,
         ) as response:
+            if existing_size > 0 and response.status_code == 416:
+                return file_path
+
             response.raise_for_status()
-            content_length = self._validate_content_length(response)
+
+            if existing_size > 0 and response.status_code == 200:
+                logger.warning(
+                    f"媒体 url: {url} 不支持断点续传，重新下载"
+                )
+                existing_size = 0
+                open_mode = "wb"
+            else:
+                open_mode = "ab" if existing_size > 0 else "wb"
+
+            content_length = self._validate_content_length(response, existing_size)
+            if existing_size > 0 and response.status_code == 206 and content_length == 0:
+                return file_path
 
             with self.rich_progress(
                 f"httpx | {file_path.name}",
-                content_length,
+                content_length or None,
             ) as update_progress:
-                async with aiofiles.open(file_path, "wb") as file:
+                async with aiofiles.open(file_path, open_mode) as file:
                     async for chunk in response.aiter_bytes(chunk_size):
                         await file.write(chunk)
                         update_progress(advance=len(chunk))
@@ -107,6 +139,11 @@ class StreamDownloader:
         file_path: Path,
         headers: dict[str, str],
     ) -> Path:
+        existing_size = file_path.stat().st_size if file_path.exists() else 0
+        headers = headers.copy()
+        if existing_size > 0:
+            headers["Range"] = f"bytes={existing_size}-"
+
         async with curl_cffi.AsyncSession(allow_redirects=True) as session:
             response: curl_cffi.Response = await session.get(
                 url,
@@ -115,14 +152,29 @@ class StreamDownloader:
                 stream=True,
                 proxy=pconfig.cnproxy or None
             )
+            if existing_size > 0 and response.status_code == 416:
+                return file_path
+
             response.raise_for_status()
-            content_length = self._validate_content_length(response)
+
+            if existing_size > 0 and response.status_code == 200:
+                logger.warning(
+                    f"媒体 url: {url} 不支持断点续传，重新下载"
+                )
+                existing_size = 0
+                open_mode = "wb"
+            else:
+                open_mode = "ab" if existing_size > 0 else "wb"
+
+            content_length = self._validate_content_length(response, existing_size)
+            if existing_size > 0 and response.status_code == 206 and content_length == 0:
+                return file_path
 
             with self.rich_progress(
                 f"curl_cffi | {file_path.name}",
-                content_length,
+                content_length or None,
             ) as update_progress:
-                async with aiofiles.open(file_path, "wb") as file:
+                async with aiofiles.open(file_path, open_mode) as file:
                     async for chunk in response.aiter_content(chunk_size=8192):
                         await file.write(chunk)
                         update_progress(advance=len(chunk))
@@ -141,21 +193,20 @@ class StreamDownloader:
         if not file_name:
             file_name = generate_file_name(url)
         file_path = self.cache_dir / file_name
-        if file_path.exists():
-            return file_path
-
         headers = {**self.headers, **(ext_headers or {})}
 
         try:
-            path = await self._download_file_with_httpx(
-                url, file_path=file_path, headers=headers, chunk_size=chunk_size
+            path = await self._download_file_with_curl_cffi(
+                url, file_path=file_path, headers=headers
             )
         except Exception:
-            logger.opt(exception=True).warning(f"下载失败(httpx) | url: {url}")
+            logger.opt(exception=True).warning(f"下载失败(curl_cffi) | url: {url}")
             try:
-                path = await self._download_file_with_curl_cffi(url, file_path=file_path, headers=headers)
+                path = await self._download_file_with_httpx(
+                    url, file_path=file_path, headers=headers, chunk_size=chunk_size
+                )
             except Exception:
-                logger.opt(exception=True).warning(f"下载失败(curl_cffi) | url: {url}")
+                logger.opt(exception=True).warning(f"下载失败(httpx) | url: {url}")
                 raise DownloadException("媒体下载失败")
 
         return path
