@@ -24,7 +24,7 @@ class Config(BaseModel):
     """小红书 cookies"""
     parser_proxy: str | None = None
     """代理"""
-    parser_cnproxy: str | None = None
+    parser_cn_proxy: str | None = None
     """中国大陆代理"""
     parser_need_upload: bool = False
     """是否需要上传音频文件"""
@@ -134,7 +134,7 @@ class Config(BaseModel):
     @property
     def cnproxy(self) -> str | None:
         """中国大陆代理"""
-        return self.cnproxy
+        return self.parser_cn_proxy
 
     @property
     def need_upload(self) -> bool:
