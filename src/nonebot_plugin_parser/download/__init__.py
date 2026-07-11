@@ -7,7 +7,6 @@ from tenacity import retry, stop_after_attempt, wait_none
 
 import httpx
 import aiofiles
-import curl_cffi
 from nonebot import logger, get_driver
 from rich.progress import (
     Progress,
@@ -76,7 +75,7 @@ class StreamDownloader:
 
     @staticmethod
     def _validate_content_length(
-        response: httpx.Response | curl_cffi.Response,
+        response: httpx.Response,
         existing_size: int = 0,
     ) -> int:
         """获取文件长度，返回本次响应的字节长度。"""
@@ -133,6 +132,7 @@ class StreamDownloader:
             response.raise_for_status()
             return 0, False
 
+    @retry(stop=stop_after_attempt(5), wait=wait_none())
     async def _download_segment_with_httpx(
         self,
         url: str,
@@ -199,54 +199,6 @@ class StreamDownloader:
 
         return file_path
 
-    async def _download_file_with_httpx_sequential(
-        self,
-        url: str,
-        *,
-        file_path: Path,
-        headers: dict[str, str],
-        chunk_size: int = 64 * 1024,
-    ) -> Path:
-        existing_size = file_path.stat().st_size if file_path.exists() else 0
-        headers = headers.copy()
-        if existing_size > 0:
-            headers["Range"] = f"bytes={existing_size}-"
-
-        async with self.client.stream(
-            "GET",
-            url,
-            headers=headers,
-            follow_redirects=True,
-        ) as response:
-            if existing_size > 0 and response.status_code == 416:
-                return file_path
-
-            response.raise_for_status()
-
-            if existing_size > 0 and response.status_code == 200:
-                logger.warning(
-                    f"媒体 url: {url} 不支持断点续传，重新下载"
-                )
-                existing_size = 0
-                open_mode = "wb"
-            else:
-                open_mode = "ab" if existing_size > 0 else "wb"
-
-            content_length = self._validate_content_length(response, existing_size)
-            if response.status_code == 206 and content_length == 0:
-                return file_path
-
-            with self.rich_progress(
-                f"httpx | {file_path.name}",
-                content_length or None,
-            ) as update_progress:
-                async with aiofiles.open(file_path, open_mode) as file:
-                    async for chunk in response.aiter_bytes(chunk_size):
-                        await file.write(chunk)
-                        update_progress(advance=len(chunk))
-
-        return file_path
-
     async def _download_file_with_httpx(
         self,
         url: str,
@@ -255,15 +207,7 @@ class StreamDownloader:
         headers: dict[str, str],
         chunk_size: int = 64 * 1024,
     ) -> Path:
-        """download file by url with stream"""
-        if file_path.exists() and file_path.stat().st_size > 0:
-            return await self._download_file_with_httpx_sequential(
-                url,
-                file_path=file_path,
-                headers=headers,
-                chunk_size=chunk_size,
-            )
-
+        """download file by url with stream using concurrent segmented downloads"""
         try:
             return await self._download_file_parallel_with_httpx(
                 url,
@@ -273,189 +217,8 @@ class StreamDownloader:
             )
         except Exception:
             logger.opt(exception=True).warning(f"分片下载失败(httpx) | url: {url}")
-            return await self._download_file_with_httpx_sequential(
-                url,
-                file_path=file_path,
-                headers=headers,
-                chunk_size=chunk_size,
-            )
+            raise
 
-    async def _probe_curl_cffi_range(
-        self,
-        url: str,
-        headers: dict[str, str],
-    ) -> tuple[int, bool]:
-        probe_headers = headers.copy()
-        probe_headers["Range"] = "bytes=0-0"
-
-        async with curl_cffi.AsyncSession(allow_redirects=True) as session:
-            response: curl_cffi.Response = await session.get(
-                url,
-                headers=probe_headers,
-                timeout=DOWNLOAD_TIMEOUT,
-                stream=True,
-                proxy=pconfig.cnproxy or None,
-            )
-            if response.status_code == 206:
-                content_range = response.headers.get("Content-Range", "")
-                total_size = self._parse_total_size(content_range)
-                response.raise_for_status()
-                return total_size, True
-
-            if response.status_code == 200:
-                content_length = response.headers.get("Content-Length")
-                total_size = int(content_length) if content_length else 0
-                return total_size, False
-
-            response.raise_for_status()
-            return 0, False
-
-    async def _download_segment_with_curl_cffi(
-        self,
-        url: str,
-        file_path: Path,
-        headers: dict[str, str],
-        start: int,
-        end: int,
-        chunk_size: int,
-        update_progress,
-    ) -> None:
-        segment_headers = headers.copy()
-        segment_headers["Range"] = f"bytes={start}-{end}"
-
-        async with curl_cffi.AsyncSession(allow_redirects=True) as session:
-            response: curl_cffi.Response = await session.get(
-                url,
-                headers=segment_headers,
-                timeout=DOWNLOAD_TIMEOUT,
-                stream=True,
-                proxy=pconfig.cnproxy or None,
-            )
-            response.raise_for_status()
-            if response.status_code != 206:
-                raise DownloadException("媒体不支持分段下载")
-
-            async with aiofiles.open(file_path, "r+b") as file:
-                await file.seek(start)
-                async for chunk in response.aiter_content(chunk_size=chunk_size):
-                    await file.write(chunk)
-                    update_progress(advance=len(chunk))
-
-    async def _download_file_parallel_with_curl_cffi(
-        self,
-        url: str,
-        *,
-        file_path: Path,
-        headers: dict[str, str],
-    ) -> Path:
-        total_size, range_supported = await self._probe_curl_cffi_range(url, headers)
-        if not range_supported or total_size <= 0:
-            raise DownloadException("不支持并发分片下载")
-
-        if file_path.exists() and file_path.stat().st_size == total_size:
-            return file_path
-
-        self._prepare_target_file(file_path, total_size)
-
-        ranges = self._build_ranges(total_size, self.SEGMENT_SIZE)
-        semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_SEGMENTS)
-
-        with self.rich_progress(f"curl_cffi | {file_path.name}", total_size) as update_progress:
-            async def worker(start: int, end: int) -> None:
-                async with semaphore:
-                    await self._download_segment_with_curl_cffi(
-                        url,
-                        file_path=file_path,
-                        headers=headers,
-                        start=start,
-                        end=end,
-                        chunk_size=8192,
-                        update_progress=update_progress,
-                    )
-
-            await asyncio.gather(*(worker(start, end) for start, end in ranges))
-
-        return file_path
-
-    @retry(stop=stop_after_attempt(5), wait=wait_none())
-    async def _download_file_with_curl_cffi_sequential(
-        self,
-        url: str,
-        *,
-        file_path: Path,
-        headers: dict[str, str],
-    ) -> Path:
-        existing_size = file_path.stat().st_size if file_path.exists() else 0
-        headers = headers.copy()
-        if existing_size > 0:
-            headers["Range"] = f"bytes={existing_size}-"
-
-        async with curl_cffi.AsyncSession(allow_redirects=True) as session:
-            response: curl_cffi.Response = await session.get(
-                url,
-                headers=headers,
-                timeout=DOWNLOAD_TIMEOUT,
-                stream=True,
-                proxy=pconfig.cnproxy or None
-            )
-            if existing_size > 0 and response.status_code == 416:
-                return file_path
-
-            response.raise_for_status()
-
-            if existing_size > 0 and response.status_code == 200:
-                logger.warning(
-                    f"媒体 url: {url} 不支持断点续传，重新下载"
-                )
-                existing_size = 0
-                open_mode = "wb"
-            else:
-                open_mode = "ab" if existing_size > 0 else "wb"
-
-            content_length = self._validate_content_length(response, existing_size)
-            if response.status_code == 206 and content_length == 0:
-                return file_path
-
-            with self.rich_progress(
-                f"curl_cffi | {file_path.name}",
-                content_length or None,
-            ) as update_progress:
-                async with aiofiles.open(file_path, open_mode) as file:
-                    async for chunk in response.aiter_content(chunk_size=8192):
-                        await file.write(chunk)
-                        update_progress(advance=len(chunk))
-
-        return file_path
-
-    @retry(stop=stop_after_attempt(5), wait=wait_none())
-    async def _download_file_with_curl_cffi(
-        self,
-        url: str,
-        *,
-        file_path: Path,
-        headers: dict[str, str],
-    ) -> Path:
-        existing_size = file_path.stat().st_size if file_path.exists() else 0
-        if existing_size > 0:
-            return await self._download_file_with_curl_cffi_sequential(
-                url,
-                file_path=file_path,
-                headers=headers,
-            )
-
-        try:
-            return await self._download_file_parallel_with_curl_cffi(
-                url,
-                file_path=file_path,
-                headers=headers,
-            )
-        except Exception:
-            logger.opt(exception=True).warning(f"分片下载失败(curl_cffi) | url: {url}")
-            return await self._download_file_with_curl_cffi_sequential(
-                url,
-                file_path=file_path,
-                headers=headers,
-            )
 
     async def _download_file(
         self,
@@ -472,18 +235,12 @@ class StreamDownloader:
         headers = {**self.headers, **(ext_headers or {})}
 
         try:
-            path = await self._download_file_with_curl_cffi(
-                url, file_path=file_path, headers=headers
+            path = await self._download_file_with_httpx(
+                url, file_path=file_path, headers=headers, chunk_size=chunk_size
             )
         except Exception:
-            logger.opt(exception=True).warning(f"下载失败(curl_cffi) | url: {url}")
-            try:
-                path = await self._download_file_with_httpx(
-                    url, file_path=file_path, headers=headers, chunk_size=chunk_size
-                )
-            except Exception:
-                logger.opt(exception=True).warning(f"下载失败(httpx) | url: {url}")
-                raise DownloadException("媒体下载失败")
+            logger.opt(exception=True).warning(f"下载失败(httpx) | url: {url}")
+            raise DownloadException("媒体下载失败")
 
         return path
 

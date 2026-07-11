@@ -76,68 +76,6 @@ async def test_httpx_download_resume(tmp_path, monkeypatch):
     assert file_path.read_bytes() == b"1234567890ABCDE"
 
 
-@pytest.mark.asyncio
-async def test_curl_cffi_download_resume(tmp_path, monkeypatch):
-    from nonebot_plugin_parser.download import downloader
-
-    file_path = tmp_path / "resume_test_curl.bin"
-    file_path.write_bytes(b"1234567890")
-    url = "https://example.com/file.bin"
-
-    class DummyResponse:
-        def __init__(self, data: bytes):
-            self.status_code = 206
-            self.headers = {
-                "Content-Length": str(len(data)),
-                "Content-Range": f"bytes 10-{10 + len(data) - 1}/15",
-            }
-            self._data = data
-
-        def raise_for_status(self):
-            return None
-
-        async def aiter_content(self, chunk_size=8192):
-            for i in range(0, len(self._data), chunk_size):
-                yield self._data[i : i + chunk_size]
-
-    class DummySession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def get(self, *args, **kwargs):
-            assert kwargs["headers"]["Range"] == "bytes=10-"
-            return DummyResponse(b"ABCDE")
-
-    def dummy_rich_progress(desc: str, total: int | None = None):
-        class DummyProgress:
-            def __enter__(self):
-                return lambda *args, **kwargs: None
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        return DummyProgress()
-
-    monkeypatch.setattr(curl_cffi, "AsyncSession", DummySession)
-    monkeypatch.setattr(
-        downloader.__class__,
-        "rich_progress",
-        staticmethod(dummy_rich_progress),
-    )
-
-    path = await downloader._download_file_with_curl_cffi(
-        url,
-        file_path=file_path,
-        headers={"Accept": "*/*"},
-    )
-
-    assert path == file_path
-    assert file_path.read_bytes() == b"1234567890ABCDE"
-
-
 def test_limited_size_dict():
     from nonebot_plugin_parser.download.ytdlp import LimitedSizeDict
 
