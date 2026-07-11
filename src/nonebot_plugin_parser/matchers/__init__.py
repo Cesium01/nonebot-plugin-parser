@@ -81,11 +81,11 @@ async def parser_handler(
     # 3. 渲染内容消息并发送
     renderer = get_renderer(result.platform.name)(result)
     async for message in renderer.render_messages():
-        if message.has(Video):
-            file_path = await UniHelper.upload_video_via_stream(message)
-            await UniMessage(Video(path=file_path)).send()
-        else:
-            await message.send()
+        # if message.has(Video):
+        #     file_path = await UniHelper.upload_video_via_stream(message)
+        #     await UniMessage(Video(path=file_path)).send()
+        # else:
+        await message.send()
 
     # 4. 缓存解析结果
     _RESULT_CACHE[cache_key] = result

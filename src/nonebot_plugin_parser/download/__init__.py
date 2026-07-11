@@ -141,10 +141,10 @@ class StreamDownloader:
         start: int,
         end: int,
         chunk_size: int,
-        update_progress,
     ) -> None:
         segment_headers = headers.copy()
         segment_headers["Range"] = f"bytes={start}-{end}"
+        segment_size = end - start + 1
 
         async with self.client.stream(
             "GET",
@@ -156,11 +156,15 @@ class StreamDownloader:
             if response.status_code != 206:
                 raise DownloadException("媒体不支持分段下载")
 
-            async with aiofiles.open(file_path, "r+b") as file:
-                await file.seek(start)
-                async for chunk in response.aiter_bytes(chunk_size):
-                    await file.write(chunk)
-                    update_progress(advance=len(chunk))
+            with self.rich_progress(
+                f"httpx | {file_path.name} ({start}-{end})",
+                segment_size,
+            ) as update_progress:
+                async with aiofiles.open(file_path, "r+b") as file:
+                    await file.seek(start)
+                    async for chunk in response.aiter_bytes(chunk_size):
+                        await file.write(chunk)
+                        update_progress(advance=len(chunk))
 
     async def _download_file_parallel_with_httpx(
         self,
@@ -182,20 +186,18 @@ class StreamDownloader:
         ranges = self._build_ranges(total_size, self.SEGMENT_SIZE)
         semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_SEGMENTS)
 
-        with self.rich_progress(f"httpx | {file_path.name}", total_size) as update_progress:
-            async def worker(start: int, end: int) -> None:
-                async with semaphore:
-                    await self._download_segment_with_httpx(
-                        url,
-                        file_path=file_path,
-                        headers=headers,
-                        start=start,
-                        end=end,
-                        chunk_size=chunk_size,
-                        update_progress=update_progress,
-                    )
+        async def worker(start: int, end: int) -> None:
+            async with semaphore:
+                await self._download_segment_with_httpx(
+                    url,
+                    file_path=file_path,
+                    headers=headers,
+                    start=start,
+                    end=end,
+                    chunk_size=chunk_size,
+                )
 
-            await asyncio.gather(*(worker(start, end) for start, end in ranges))
+        await asyncio.gather(*(worker(start, end) for start, end in ranges))
 
         return file_path
 
