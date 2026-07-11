@@ -3,6 +3,7 @@ from pathlib import Path
 from functools import partial
 from contextlib import contextmanager
 from urllib.parse import urljoin
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 import httpx
 import aiofiles
@@ -67,6 +68,7 @@ class StreamDownloader:
 
         return content_length
 
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
     async def _download_file_with_httpx(
         self,
         url: str,
@@ -97,6 +99,7 @@ class StreamDownloader:
 
         return file_path
 
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
     async def _download_file_with_curl_cffi(
         self,
         url: str,

@@ -41,6 +41,7 @@ dependencies = [
   "rich>=13.0.0",
   "pillow>=11.0.0",
   "aiofiles>=25.1.0",
+  "tenacity>=9.1.4",
   "httpx[socks]>=0.27.2,<1.0.0",
   "msgspec>=0.20.0,<1.0.0",
   "nonebot2>=2.5.0,<3.0.0",
