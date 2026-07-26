@@ -33,8 +33,9 @@ class StreamDownloader:
     async def aclose(self):
         await self.client.aclose()
 
-    SEGMENT_SIZE: int = 3 * 1024 * 1024
-    MAX_CONCURRENT_SEGMENTS: int = 4
+    SEGMENT_SIZE: int = 10 * 1024 * 1024
+    MAX_CONCURRENT_SEGMENTS: int = 16
+    SEGMENT_DOWNLOAD_THRESHOLD: int = 50 * 1024 * 1024
 
     @staticmethod
     @contextmanager
@@ -173,10 +174,12 @@ class StreamDownloader:
         file_path: Path,
         headers: dict[str, str],
         chunk_size: int,
+        total_size: int | None = None,
     ) -> Path:
-        total_size, range_supported = await self._probe_httpx_range(url, headers)
-        if not range_supported or total_size <= 0:
-            raise DownloadException("不支持并发分片下载")
+        if total_size is None:
+            total_size, range_supported = await self._probe_httpx_range(url, headers)
+            if not range_supported or total_size <= 0:
+                raise DownloadException("不支持并发分片下载")
 
         if file_path.exists() and file_path.stat().st_size == total_size:
             return file_path
@@ -201,6 +204,36 @@ class StreamDownloader:
 
         return file_path
 
+    @retry(stop=stop_after_attempt(5), wait=wait_none())
+    async def _download_file_sequential_with_httpx(
+        self,
+        url: str,
+        *,
+        file_path: Path,
+        headers: dict[str, str],
+        chunk_size: int,
+    ) -> Path:
+        """Download a file with a single request."""
+        async with self.client.stream(
+            "GET",
+            url,
+            headers=headers,
+            follow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            content_length = self._validate_content_length(response)
+
+            with self.rich_progress(
+                f"httpx | {file_path.name}",
+                content_length,
+            ) as update_progress:
+                async with aiofiles.open(file_path, "wb") as file:
+                    async for chunk in response.aiter_bytes(chunk_size):
+                        await file.write(chunk)
+                        update_progress(advance=len(chunk))
+
+        return file_path
+
     async def _download_file_with_httpx(
         self,
         url: str,
@@ -209,17 +242,26 @@ class StreamDownloader:
         headers: dict[str, str],
         chunk_size: int = 64 * 1024,
     ) -> Path:
-        """download file by url with stream using concurrent segmented downloads"""
-        try:
-            return await self._download_file_parallel_with_httpx(
-                url,
-                file_path=file_path,
-                headers=headers,
-                chunk_size=chunk_size,
-            )
-        except Exception:
-            logger.opt(exception=True).warning(f"分片下载失败(httpx) | url: {url}")
-            raise
+        """Download large range-supported files in parallel, otherwise sequentially."""
+        total_size, range_supported = await self._probe_httpx_range(url, headers)
+        if range_supported and total_size > self.SEGMENT_DOWNLOAD_THRESHOLD:
+            try:
+                return await self._download_file_parallel_with_httpx(
+                    url,
+                    file_path=file_path,
+                    headers=headers,
+                    chunk_size=chunk_size,
+                    total_size=total_size,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(f"分片下载失败(httpx)，回退普通下载 | url: {url}")
+
+        return await self._download_file_sequential_with_httpx(
+            url,
+            file_path=file_path,
+            headers=headers,
+            chunk_size=chunk_size,
+        )
 
 
     async def _download_file(

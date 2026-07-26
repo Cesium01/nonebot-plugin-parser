@@ -326,10 +326,17 @@ class BilibiliParser(BaseParser):
             no_dolby_video=True,
             no_hdr=True,
         )
-        video_stream = next(stream for stream in streams if isinstance(stream, VideoStreamDownloadURL))
-        if not isinstance(video_stream, VideoStreamDownloadURL):
+        video_stream = min(
+            (stream for stream in streams if isinstance(stream, VideoStreamDownloadURL)),
+            key=lambda stream: stream.bandwidth,
+            default=None,
+        )
+        if video_stream is None:
             raise DownloadException("未找到可下载的视频流")
-        logger.debug(f"视频流质量: {video_stream.video_quality.name}, 编码: {video_stream.video_codecs}")
+        logger.debug(
+            f"选择最小视频流: {video_stream.video_quality.name}, "
+            f"编码: {video_stream.video_codecs}, 码率: {video_stream.bandwidth} bps"
+        )
 
         audio_stream = next((stream for stream in streams if isinstance(stream, AudioStreamDownloadURL)), None)
         if not isinstance(audio_stream, AudioStreamDownloadURL):
