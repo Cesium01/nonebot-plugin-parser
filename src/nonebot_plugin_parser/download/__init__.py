@@ -1,20 +1,13 @@
 import asyncio
 from pathlib import Path
-from functools import partial
-from contextlib import contextmanager
 from urllib.parse import urljoin
 from tenacity import retry, stop_after_attempt, wait_none
 
 import httpx
 import aiofiles
 from nonebot import logger, get_driver
-from rich.progress import (
-    Progress,
-    BarColumn,
-    TextColumn,
-    DownloadColumn,
-)
 
+from .rich import add_progress_task
 from .task import auto_task
 from ..utils import merge_av, safe_unlink, generate_file_name, is_module_available
 from ..config import pconfig
@@ -223,14 +216,14 @@ class StreamDownloader:
             response.raise_for_status()
             content_length = self._validate_content_length(response)
 
-            with self.rich_progress(
+            update_progress = add_progress_task(
                 f"httpx | {file_path.name}",
                 content_length,
-            ) as update_progress:
-                async with aiofiles.open(file_path, "wb") as file:
-                    async for chunk in response.aiter_bytes(chunk_size):
-                        await file.write(chunk)
-                        update_progress(advance=len(chunk))
+            )
+            async with aiofiles.open(file_path, "wb") as file:
+                async for chunk in response.aiter_bytes(chunk_size):
+                    await file.write(chunk)
+                    update_progress(advance=len(chunk))
 
         return file_path
 
@@ -376,14 +369,12 @@ class StreamDownloader:
 
         try:
             async with aiofiles.open(video_path, "wb") as f:
-                total_size = 0
-                with self.rich_progress(desc=video_name) as update_progress:
-                    for url in await self._get_m3u8_slices(m3u8_url):
-                        async with self.client.stream("GET", url, headers=ext_headers) as response:
-                            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                                await f.write(chunk)
-                                total_size += len(chunk)
-                                update_progress(advance=len(chunk), total=total_size)
+                update_progress = add_progress_task(desc=video_name)
+                for url in await self._get_m3u8_slices(m3u8_url):
+                    async with self.client.stream("GET", url, headers=ext_headers) as response:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                            await f.write(chunk)
+                            update_progress(advance=len(chunk))
         except httpx.HTTPError:
             await safe_unlink(video_path)
             logger.exception("m3u8 视频下载失败")
