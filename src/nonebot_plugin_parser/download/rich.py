@@ -1,4 +1,6 @@
 from functools import partial
+from contextlib import contextmanager
+from collections.abc import Callable, Generator
 
 from rich.progress import (
     Progress,
@@ -16,25 +18,19 @@ progress_bar: Progress = Progress(
 )
 
 
-def add_progress_task(
+@contextmanager
+def progress_task(
     desc: str,
     total: int | None = None,
-):
+) -> Generator[Callable[..., None], None, None]:
     task_id = progress_bar.add_task(description=desc, total=total)
     progress_bar.start_task(task_id)
-    return partial(progress_bar.update, task_id)
+    if not progress_bar.live.is_started:
+        progress_bar.start()
 
-
-from nonebot import get_driver
-
-driver = get_driver()
-
-
-@driver.on_startup
-async def enter_progress_bar():
-    progress_bar.start()
-
-
-@driver.on_shutdown
-async def exit_progress_bar():
-    progress_bar.stop()
+    try:
+        yield partial(progress_bar.update, task_id)
+    finally:
+        progress_bar.remove_task(task_id)
+        if not progress_bar.tasks:
+            progress_bar.stop()

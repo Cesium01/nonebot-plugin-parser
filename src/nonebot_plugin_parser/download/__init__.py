@@ -1,13 +1,13 @@
 import asyncio
 from pathlib import Path
 from urllib.parse import urljoin
-from tenacity import retry, stop_after_attempt, wait_none
 
 import httpx
 import aiofiles
 from nonebot import logger, get_driver
+from tenacity import retry, wait_none, stop_after_attempt
 
-from .rich import add_progress_task
+from .rich import progress_task
 from .task import auto_task
 from ..utils import merge_av, safe_unlink, generate_file_name, is_module_available
 from ..config import pconfig
@@ -134,15 +134,15 @@ class StreamDownloader:
             if response.status_code != 206:
                 raise DownloadException("媒体不支持分段下载")
 
-            update_progress = add_progress_task(
+            with progress_task(
                 f"httpx | {file_path.name} ({start}-{end})",
                 segment_size,
-            )
-            async with aiofiles.open(file_path, "r+b") as file:
-                await file.seek(start)
-                async for chunk in response.aiter_bytes(chunk_size):
-                    await file.write(chunk)
-                    update_progress(advance=len(chunk))
+            ) as update_progress:
+                async with aiofiles.open(file_path, "r+b") as file:
+                    await file.seek(start)
+                    async for chunk in response.aiter_bytes(chunk_size):
+                        await file.write(chunk)
+                        update_progress(advance=len(chunk))
 
     async def _download_file_parallel_with_httpx(
         self,
@@ -200,14 +200,14 @@ class StreamDownloader:
             response.raise_for_status()
             content_length = self._validate_content_length(response)
 
-            update_progress = add_progress_task(
+            with progress_task(
                 f"httpx | {file_path.name}",
                 content_length,
-            )
-            async with aiofiles.open(file_path, "wb") as file:
-                async for chunk in response.aiter_bytes(chunk_size):
-                    await file.write(chunk)
-                    update_progress(advance=len(chunk))
+            ) as update_progress:
+                async with aiofiles.open(file_path, "wb") as file:
+                    async for chunk in response.aiter_bytes(chunk_size):
+                        await file.write(chunk)
+                        update_progress(advance=len(chunk))
 
         return file_path
 
@@ -239,7 +239,6 @@ class StreamDownloader:
             headers=headers,
             chunk_size=chunk_size,
         )
-
 
     async def _download_file(
         self,
@@ -353,12 +352,12 @@ class StreamDownloader:
 
         try:
             async with aiofiles.open(video_path, "wb") as f:
-                update_progress = add_progress_task(desc=video_name)
-                for url in await self._get_m3u8_slices(m3u8_url):
-                    async with self.client.stream("GET", url, headers=ext_headers) as response:
-                        async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                            await f.write(chunk)
-                            update_progress(advance=len(chunk))
+                with progress_task(desc=video_name) as update_progress:
+                    for url in await self._get_m3u8_slices(m3u8_url):
+                        async with self.client.stream("GET", url, headers=ext_headers) as response:
+                            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                                await f.write(chunk)
+                                update_progress(advance=len(chunk))
         except httpx.HTTPError:
             await safe_unlink(video_path)
             logger.exception("m3u8 视频下载失败")
