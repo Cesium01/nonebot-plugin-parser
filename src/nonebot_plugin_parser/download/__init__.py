@@ -1,5 +1,4 @@
 import asyncio
-from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urljoin
 from tenacity import retry, stop_after_attempt, wait_none
@@ -30,22 +29,6 @@ class StreamDownloader:
     SEGMENT_SIZE: int = 10 * 1024 * 1024
     MAX_CONCURRENT_SEGMENTS: int = 16
     SEGMENT_DOWNLOAD_THRESHOLD: int = 50 * 1024 * 1024
-
-    @staticmethod
-    @contextmanager
-    def rich_progress(
-        desc: str,
-        total: int | None = None,
-    ):
-        with Progress(
-            TextColumn("[bold blue]{task.description}", justify="right"),
-            BarColumn(bar_width=None),
-            "[progress.percentage]{task.percentage:>3.1f}%",
-            "•",
-            DownloadColumn(),
-        ) as progress:
-            task_id = progress.add_task(description=desc, total=total)
-            yield partial(progress.update, task_id)
 
     @staticmethod
     def _build_ranges(total_size: int, segment_size: int) -> list[tuple[int, int]]:
@@ -151,15 +134,15 @@ class StreamDownloader:
             if response.status_code != 206:
                 raise DownloadException("媒体不支持分段下载")
 
-            with self.rich_progress(
+            update_progress = add_progress_task(
                 f"httpx | {file_path.name} ({start}-{end})",
                 segment_size,
-            ) as update_progress:
-                async with aiofiles.open(file_path, "r+b") as file:
-                    await file.seek(start)
-                    async for chunk in response.aiter_bytes(chunk_size):
-                        await file.write(chunk)
-                        update_progress(advance=len(chunk))
+            )
+            async with aiofiles.open(file_path, "r+b") as file:
+                await file.seek(start)
+                async for chunk in response.aiter_bytes(chunk_size):
+                    await file.write(chunk)
+                    update_progress(advance=len(chunk))
 
     async def _download_file_parallel_with_httpx(
         self,
