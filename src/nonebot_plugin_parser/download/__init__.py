@@ -7,7 +7,6 @@ import aiofiles
 from nonebot import logger, get_driver
 from tenacity import retry, wait_none, stop_after_attempt
 
-from .rich import progress_task
 from .task import auto_task
 from ..utils import merge_av, safe_unlink, generate_file_name, is_module_available
 from ..config import pconfig
@@ -53,164 +52,23 @@ class StreamDownloader:
 
     @staticmethod
     def _validate_content_length(
-        response: httpx.Response,
-        existing_size: int = 0,
+        response: httpx.Response
     ) -> int:
         """获取文件长度，返回本次响应的字节长度。"""
         content_length = response.headers.get("Content-Length")
         content_length = int(content_length) if content_length else 0
-        total_length = 0
 
-        if response.status_code == 206:
-            content_range = response.headers.get("Content-Range", "")
-            try:
-                total_length = int(content_range.split("/")[-1])
-            except (ValueError, IndexError):
-                total_length = existing_size + content_length
-            if content_length == 0 and total_length > existing_size:
-                content_length = total_length - existing_size
-        else:
-            total_length = content_length
-
-        if total_length == 0:
+        if content_length == 0:
             logger.warning(f"媒体 url: {response.url}, 大小为 0, 取消下载")
             raise IgnoreException
 
-        if (file_size := total_length / 1024 / 1024) > pconfig.max_size:
+        if (file_size := content_length / 1024 / 1024) > pconfig.max_size:
             logger.warning(f"媒体 url: {response.url} 大小 {file_size:.2f} MB, 超过 {pconfig.max_size} MB, 取消下载")
             raise IgnoreException
 
         return content_length
 
-    async def _probe_httpx_range(
-        self,
-        url: str,
-        headers: dict[str, str],
-    ) -> tuple[int, bool]:
-        probe_headers = headers.copy()
-        probe_headers["Range"] = "bytes=0-0"
-
-        async with self.client.stream(
-            "GET",
-            url,
-            headers=probe_headers,
-            follow_redirects=True,
-        ) as response:
-            if response.status_code == 206:
-                content_range = response.headers.get("Content-Range", "")
-                total_size = self._parse_total_size(content_range)
-                response.raise_for_status()
-                return total_size, True
-
-            if response.status_code == 200:
-                content_length = response.headers.get("Content-Length")
-                total_size = int(content_length) if content_length else 0
-                return total_size, False
-
-            response.raise_for_status()
-            return 0, False
-
-    @retry(stop=stop_after_attempt(5), wait=wait_none())
-    async def _download_segment_with_httpx(
-        self,
-        url: str,
-        file_path: Path,
-        headers: dict[str, str],
-        start: int,
-        end: int,
-        chunk_size: int,
-    ) -> None:
-        segment_headers = headers.copy()
-        segment_headers["Range"] = f"bytes={start}-{end}"
-        segment_size = end - start + 1
-
-        async with self.client.stream(
-            "GET",
-            url,
-            headers=segment_headers,
-            follow_redirects=True,
-        ) as response:
-            response.raise_for_status()
-            if response.status_code != 206:
-                raise DownloadException("媒体不支持分段下载")
-
-            with progress_task(
-                f"httpx | {file_path.name} ({start}-{end})",
-                segment_size,
-            ) as update_progress:
-                async with aiofiles.open(file_path, "r+b") as file:
-                    await file.seek(start)
-                    async for chunk in response.aiter_bytes(chunk_size):
-                        await file.write(chunk)
-                        update_progress(advance=len(chunk))
-
-    async def _download_file_parallel_with_httpx(
-        self,
-        url: str,
-        *,
-        file_path: Path,
-        headers: dict[str, str],
-        chunk_size: int,
-        total_size: int | None = None,
-    ) -> Path:
-        if total_size is None:
-            total_size, range_supported = await self._probe_httpx_range(url, headers)
-            if not range_supported or total_size <= 0:
-                raise DownloadException("不支持并发分片下载")
-
-        if file_path.exists() and file_path.stat().st_size == total_size:
-            return file_path
-
-        self._prepare_target_file(file_path, total_size)
-
-        ranges = self._build_ranges(total_size, self.SEGMENT_SIZE)
-        semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_SEGMENTS)
-
-        async def worker(start: int, end: int) -> None:
-            async with semaphore:
-                await self._download_segment_with_httpx(
-                    url,
-                    file_path=file_path,
-                    headers=headers,
-                    start=start,
-                    end=end,
-                    chunk_size=chunk_size,
-                )
-
-        await asyncio.gather(*(worker(start, end) for start, end in ranges))
-
-        return file_path
-
-    @retry(stop=stop_after_attempt(5), wait=wait_none())
-    async def _download_file_sequential_with_httpx(
-        self,
-        url: str,
-        *,
-        file_path: Path,
-        headers: dict[str, str],
-        chunk_size: int,
-    ) -> Path:
-        """Download a file with a single request."""
-        async with self.client.stream(
-            "GET",
-            url,
-            headers=headers,
-            follow_redirects=True,
-        ) as response:
-            response.raise_for_status()
-            content_length = self._validate_content_length(response)
-
-            with progress_task(
-                f"httpx | {file_path.name}",
-                content_length,
-            ) as update_progress:
-                async with aiofiles.open(file_path, "wb") as file:
-                    async for chunk in response.aiter_bytes(chunk_size):
-                        await file.write(chunk)
-                        update_progress(advance=len(chunk))
-
-        return file_path
-
+    @retry(wait=wait_none(), stop=stop_after_attempt(5))
     async def _download_file_with_httpx(
         self,
         url: str,
@@ -219,26 +77,20 @@ class StreamDownloader:
         headers: dict[str, str],
         chunk_size: int = 64 * 1024,
     ) -> Path:
-        """Download large range-supported files in parallel, otherwise sequentially."""
-        total_size, range_supported = await self._probe_httpx_range(url, headers)
-        if range_supported and total_size > self.SEGMENT_DOWNLOAD_THRESHOLD:
-            try:
-                return await self._download_file_parallel_with_httpx(
-                    url,
-                    file_path=file_path,
-                    headers=headers,
-                    chunk_size=chunk_size,
-                    total_size=total_size,
-                )
-            except Exception:
-                logger.opt(exception=True).warning(f"分片下载失败(httpx)，回退普通下载 | url: {url}")
-
-        return await self._download_file_sequential_with_httpx(
+        async with self.client.stream(
+            "GET",
             url,
-            file_path=file_path,
             headers=headers,
-            chunk_size=chunk_size,
-        )
+            follow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            self._validate_content_length(response)
+
+            async with aiofiles.open(file_path, "wb") as file:
+                async for chunk in response.aiter_bytes(chunk_size):
+                    await file.write(chunk)
+
+        return file_path
 
     async def _download_file(
         self,
@@ -352,12 +204,10 @@ class StreamDownloader:
 
         try:
             async with aiofiles.open(video_path, "wb") as f:
-                with progress_task(desc=video_name) as update_progress:
-                    for url in await self._get_m3u8_slices(m3u8_url):
-                        async with self.client.stream("GET", url, headers=ext_headers) as response:
-                            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                                await f.write(chunk)
-                                update_progress(advance=len(chunk))
+                for url in await self._get_m3u8_slices(m3u8_url):
+                    async with self.client.stream("GET", url, headers=ext_headers) as response:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                            await f.write(chunk)
         except httpx.HTTPError:
             await safe_unlink(video_path)
             logger.exception("m3u8 视频下载失败")
