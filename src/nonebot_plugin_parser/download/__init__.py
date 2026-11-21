@@ -83,7 +83,6 @@ class StreamDownloader:
             headers=headers,
             follow_redirects=True,
         ) as response:
-            logger.error(f"下载媒体: {response.status_code} {response.reason_phrase}")
             response.raise_for_status()
             self._validate_content_length(response)
 
