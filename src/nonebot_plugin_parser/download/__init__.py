@@ -5,7 +5,7 @@ from urllib.parse import urljoin
 import httpx
 import aiofiles
 from nonebot import logger, get_driver
-from tenacity import retry, wait_none, stop_after_attempt
+from tenacity import retry, stop_after_attempt, wait_random
 
 from .task import auto_task
 from ..utils import merge_av, safe_unlink, generate_file_name, is_module_available
@@ -68,7 +68,7 @@ class StreamDownloader:
 
         return content_length
 
-    @retry(wait=wait_none(), stop=stop_after_attempt(5))
+    @retry(wait=wait_random(1, 2), stop=stop_after_attempt(5))
     async def _download_file_with_httpx(
         self,
         url: str,
