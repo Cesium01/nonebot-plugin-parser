@@ -104,12 +104,12 @@ async def _(message: Message = CommandArg()):
 
     parser = get_parser_by_type(BilibiliParser)
 
-    _, audio_url = await parser.extract_download_urls(bvid=bvid, page_index=page_idx)
-    if not audio_url:
+    _, audio_source = await parser.extract_download_sources(bvid=bvid, page_index=page_idx)
+    if audio_source is None:
         await UniMessage("未找到可下载的音频").finish()
 
     audio_path = await parser.downloader.download_audio(
-        audio_url, audio_name=f"{bvid}-{page_idx}.mp3", ext_headers=parser.headers
+        audio_source, audio_name=f"{bvid}-{page_idx}.mp3", ext_headers=parser.headers
     )
     await UniMessage(UniHelper.record_seg(audio_path)).send()
 

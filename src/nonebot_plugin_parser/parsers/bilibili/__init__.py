@@ -29,6 +29,7 @@ from ..base import (
 from ..data import Platform, ImageContent, MediaContent
 from ..cookie import ck2dict
 from .dynamic import DynamicInfo
+from ...download import SegmentedSource
 
 # 选择客户端
 select_client("curl_cffi")
@@ -136,21 +137,21 @@ class BilibiliParser(BaseParser):
             output_path = pconfig.cache_dir / f"{video_info.bvid}-{page_num}.mp4"
             if output_path.exists():
                 return output_path
-            v_url, a_url = await self.extract_download_urls(video=video, page_index=page_info.index)
+            video_source, audio_source = await self.extract_download_sources(video=video, page_index=page_info.index)
             if page_info.duration > pconfig.duration_maximum:
                 logger.warning(f"视频时长 {page_info.duration} 秒, 超过 {pconfig.duration_maximum} 秒, 取消下载")
                 raise IgnoreException
-            if a_url is not None:
+            if audio_source is not None:
                 path = await self.downloader.download_av_and_merge(
-                    v_url,
-                    a_url,
+                    video_source,
+                    audio_source,
                     output_path=output_path,
                     ext_headers=self.headers,
                 )
             else:
-                path = await self.downloader._download_file(
-                    v_url,
-                    file_name=output_path.name,
+                path = await self.downloader.download_video(
+                    video_source,
+                    video_name=output_path.name,
                     ext_headers=self.headers,
                 )
             return path
@@ -313,7 +314,21 @@ class BilibiliParser(BaseParser):
         avid: int | None = None,
         page_index: int = 0,
     ) -> tuple[str, str | None]:
-        """解析视频下载链接"""
+        """解析音视频的主下载链接"""
+        video_source, audio_source = await self.extract_download_sources(
+            video=video, bvid=bvid, avid=avid, page_index=page_index
+        )
+        return video_source.url, audio_source.url if audio_source else None
+
+    async def extract_download_sources(
+        self,
+        video: Video | None = None,
+        *,
+        bvid: str | None = None,
+        avid: int | None = None,
+        page_index: int = 0,
+    ) -> tuple[SegmentedSource, SegmentedSource | None]:
+        """解析同一音视频流的主下载链接和备用链接"""
 
         from bilibili_api.video import (
             AudioStreamDownloadURL,
@@ -345,11 +360,12 @@ class BilibiliParser(BaseParser):
             f"编码: {video_stream.video_codecs}, 码率: {video_stream.bandwidth} bps"
         )
 
+        video_source = SegmentedSource(video_stream.url, tuple(video_stream.backup_url or ()))
         audio_stream = next((stream for stream in streams if isinstance(stream, AudioStreamDownloadURL)), None)
         if not isinstance(audio_stream, AudioStreamDownloadURL):
-            return video_stream.url, None
+            return video_source, None
         logger.debug(f"音频流质量: {audio_stream.audio_quality.name}")
-        return video_stream.url, audio_stream.url
+        return video_source, SegmentedSource(audio_stream.url, tuple(audio_stream.backup_url or ()))
 
     def _save_credential(self):
         """存储哔哩哔哩登录凭证"""

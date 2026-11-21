@@ -5,13 +5,14 @@ import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 from functools import partial
+from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin
 
 import httpx
 import aiofiles
 from nonebot import logger, get_driver
-from tenacity import AsyncRetrying, RetryCallState, retry_if_exception, stop_after_attempt
+from tenacity import AsyncRetrying, RetryCallState, retry_if_exception
 from aiofiles.tempfile import NamedTemporaryFile
 from aiofiles.threadpool.binary import AsyncBufferedIOBase
 
@@ -23,6 +24,13 @@ from ..exception import IgnoreException, DownloadException
 
 _RATE_LIMIT_STATUSES = {429, 567}
 _RETRYABLE_STATUSES = _RATE_LIMIT_STATUSES | {408, 500, 502, 503, 504}
+_SEGMENT_SIZE = 8 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class SegmentedSource:
+    url: str
+    backup_urls: tuple[str, ...] = ()
 
 
 def _is_retryable(error: BaseException) -> bool:
@@ -113,7 +121,9 @@ class StreamDownloader:
         return None
 
     @staticmethod
-    def _range_bounds(response: httpx.Response, offset: int, total_size: int | None) -> tuple[int, int]:
+    def _range_bounds(
+        response: httpx.Response, offset: int, total_size: int | None, requested_end: int | None
+    ) -> tuple[int, int]:
         content_range = response.headers.get("Content-Range", "")
         match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", content_range, re.IGNORECASE)
         if match:
@@ -124,6 +134,7 @@ class StreamDownloader:
                     start == offset
                     and start <= end < size
                     and (total_size is None or total_size == size)
+                    and (requested_end is None or end <= requested_end)
                     and (length is None or int(length) == end - start + 1)
                 ):
                     return end + 1, size
@@ -131,71 +142,113 @@ class StreamDownloader:
                 raise httpx.RemoteProtocolError("Invalid range response length", request=response.request) from error
         raise httpx.RemoteProtocolError("Invalid Content-Range for download resume", request=response.request)
 
-    async def _download_to_file(self, url: str, headers: dict[str, str], file: AsyncBufferedIOBase) -> None:
+    async def _download_to_file(
+        self,
+        url: str,
+        headers: dict[str, str],
+        file: AsyncBufferedIOBase,
+        *,
+        segmented: bool,
+        has_backup: bool,
+    ) -> None:
         host = httpx.URL(url).host
         base_headers = httpx.Headers(headers)
         base_headers["Accept-Encoding"] = "identity"
         validator: tuple[str, str] | None = None
         total_size: int | None = None
         resource_url: httpx.URL | None = None
+        versions: dict[str, str] = {}
+        completed_offset = 0
 
         async def receive() -> bool:
-            nonlocal validator, total_size, resource_url
-            offset = await file.tell() if validator else 0
+            nonlocal validator, total_size, resource_url, versions, completed_offset
+            offset = completed_offset if segmented else (await file.tell() if validator else 0)
             if offset == total_size:
                 offset = 0
             request_headers = base_headers.copy()
-            if offset and validator:
+            requested_end = None
+            if segmented:
+                requested_end = offset + _SEGMENT_SIZE - 1
+                if total_size is not None:
+                    requested_end = min(requested_end, total_size - 1)
+                request_headers["Range"] = f"bytes={offset}-{requested_end}"
+            elif offset:
                 request_headers["Range"] = f"bytes={offset}-"
+            if offset and validator:
                 request_headers["If-Range"] = validator[1]
 
             await self._wait_for_cooldown(host)
             async with self.client.stream("GET", url, headers=request_headers, follow_redirects=True) as response:
                 if offset and response.status_code == 416:
                     validator = None
+                    total_size = None
+                    completed_offset = 0
                     raise httpx.RemoteProtocolError("Server rejected download resume", request=response.request)
                 response.raise_for_status()
 
                 identity = response.headers.get("Content-Encoding", "identity").strip().lower() == "identity"
                 if response.status_code == 200:
-                    await file.seek(0)
-                    await file.truncate()
                     offset = 0
+                    completed_offset = 0
                     length = response.headers.get("Content-Length")
                     total_size = int(length) if length is not None else None
                     expected_end = total_size if identity else None
-                    validator = self._resume_validator(response) if identity else None
-                    resource_url = response.url
-                elif response.status_code == 206 and offset and validator:
+                elif response.status_code == 206 and (segmented or offset):
                     try:
-                        name, value = validator
-                        if not identity or response.url != resource_url or response.headers.get(name, value) != value:
+                        if not identity or (
+                            offset
+                            and (
+                                response.url != resource_url
+                                or any(response.headers.get(name, value) != value for name, value in versions.items())
+                            )
+                        ):
                             raise httpx.RemoteProtocolError("Resource changed during resume", request=response.request)
-                        expected_end, total_size = self._range_bounds(response, offset, total_size)
+                        expected_end, total_size = self._range_bounds(
+                            response, offset, total_size if offset else None, requested_end
+                        )
                     except httpx.RemoteProtocolError:
                         validator = None
+                        total_size = None
+                        completed_offset = 0
                         raise
                 else:
                     raise DownloadException(f"下载收到意外的 HTTP {response.status_code} 响应")
 
+                if offset == 0:
+                    validator = self._resume_validator(response) if identity else None
+                    resource_url = response.url
+                    versions = {
+                        name: response.headers[name] for name in ("ETag", "Last-Modified") if name in response.headers
+                    }
+                if segmented or offset == 0:
+                    # 分段只保留已经完整接收的范围，重试时覆盖当前未完成的段。
+                    await file.seek(offset)
+                    await file.truncate()
                 if total_size is not None:
                     self._validate_size(response, total_size)
                 async for chunk in response.aiter_bytes():
                     offset += len(chunk)
                     self._validate_size(response, offset)
                     if expected_end is not None and offset > expected_end:
-                        raise DownloadException("下载数据超出响应声明的长度")
+                        raise httpx.RemoteProtocolError("Download exceeded response length", request=response.request)
                     await file.write(chunk)
 
                 if expected_end is not None and offset != expected_end:
                     raise httpx.RemoteProtocolError("Incomplete download response", request=response.request)
                 self._validate_size(response, offset)
+                completed_offset = offset
                 return response.status_code == 200 or offset == total_size
+
+        def stop(state: RetryCallState) -> bool:
+            error = state.outcome.exception() if state.outcome else None
+            return state.attempt_number >= 5 or (
+                has_backup and isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 567
+            )
 
         async for attempt in AsyncRetrying(
             retry=retry_if_exception(_is_retryable),
             wait=partial(self._retry_wait, host),
-            stop=stop_after_attempt(5),
+            stop=stop,
             reraise=True,
         ):
             with attempt:
@@ -209,12 +262,14 @@ class StreamDownloader:
         *,
         file_path: Path,
         headers: dict[str, str],
+        segmented: bool = False,
+        has_backup: bool = False,
     ) -> Path:
         part_path = None
         try:
             async with NamedTemporaryFile(dir=file_path.parent, suffix=".part", delete=False) as file:
                 part_path = Path(file.name)
-                await self._download_to_file(url, headers, file)
+                await self._download_to_file(url, headers, file, segmented=segmented, has_backup=has_backup)
             return part_path.replace(file_path)
         finally:
             if part_path is not None:
@@ -222,36 +277,49 @@ class StreamDownloader:
 
     async def _download_file(
         self,
-        url: str,
+        url: str | SegmentedSource,
         *,
         file_name: str | None = None,
         ext_headers: dict[str, str] | None = None,
     ) -> Path:
         """download file by url with fallback"""
+        if isinstance(url, SegmentedSource):
+            segmented = True
+            urls = tuple(dict.fromkeys((url.url, *url.backup_urls)))
+        else:
+            segmented = False
+            urls = (url,)
         if not file_name:
-            file_name = generate_file_name(url)
+            file_name = generate_file_name(urls[0])
         file_path = self.cache_dir / file_name
         headers = {**self.headers, **(ext_headers or {})}
 
         try:
-            path = await self._download_file_with_httpx(url, file_path=file_path, headers=headers)
-        except Exception:
-            logger.opt(exception=True).warning(f"下载失败(httpx) | url: {url}")
-            raise DownloadException("媒体下载失败")
-
-        return path
+            for address in urls[:-1]:
+                try:
+                    return await self._download_file_with_httpx(
+                        address, file_path=file_path, headers=headers, segmented=True, has_backup=True
+                    )
+                except (httpx.HTTPStatusError, httpx.TransportError):
+                    logger.warning(f"下载主机 {httpx.URL(address).host} 下载失败，尝试备用地址")
+            return await self._download_file_with_httpx(
+                urls[-1], file_path=file_path, headers=headers, segmented=segmented
+            )
+        except Exception as error:
+            logger.opt(exception=True).warning(f"下载失败(httpx) | url: {urls[0]}")
+            raise DownloadException("媒体下载失败") from error
 
     @auto_task
     async def download_video(
         self,
-        url: str,
+        url: str | SegmentedSource,
         *,
         video_name: str | None = None,
         ext_headers: dict[str, str] | None = None,
     ) -> Path:
         """download video file by url with stream"""
         if video_name is None:
-            video_name = generate_file_name(url, ".mp4")
+            video_name = generate_file_name(url.url if isinstance(url, SegmentedSource) else url, ".mp4")
 
         return await self._download_file(
             url,
@@ -262,14 +330,14 @@ class StreamDownloader:
     @auto_task
     async def download_audio(
         self,
-        url: str,
+        url: str | SegmentedSource,
         *,
         audio_name: str | None = None,
         ext_headers: dict[str, str] | None = None,
     ) -> Path:
         """download audio file by url with stream"""
         if audio_name is None:
-            audio_name = generate_file_name(url, ".mp3")
+            audio_name = generate_file_name(url.url if isinstance(url, SegmentedSource) else url, ".mp3")
 
         return await self._download_file(
             url,
@@ -298,8 +366,8 @@ class StreamDownloader:
     @auto_task
     async def download_av_and_merge(
         self,
-        v_url: str,
-        a_url: str,
+        v_url: str | SegmentedSource,
+        a_url: str | SegmentedSource,
         *,
         output_path: Path,
         ext_headers: dict[str, str] | None = None,
