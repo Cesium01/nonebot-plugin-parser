@@ -1,17 +1,52 @@
+import re
+import math
+import random
 import asyncio
 from pathlib import Path
+from datetime import datetime, timezone
+from functools import partial
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin
 
 import httpx
 import aiofiles
 from nonebot import logger, get_driver
-from tenacity import retry, stop_after_attempt, wait_random
+from tenacity import AsyncRetrying, RetryCallState, retry_if_exception, stop_after_attempt
+from aiofiles.tempfile import NamedTemporaryFile
+from aiofiles.threadpool.binary import AsyncBufferedIOBase
 
 from .task import auto_task
 from ..utils import merge_av, safe_unlink, generate_file_name, is_module_available
 from ..config import pconfig
 from ..constants import COMMON_HEADER, DOWNLOAD_TIMEOUT
 from ..exception import IgnoreException, DownloadException
+
+_RATE_LIMIT_STATUSES = {429, 567}
+_RETRYABLE_STATUSES = _RATE_LIMIT_STATUSES | {408, 500, 502, 503, 504}
+
+
+def _is_retryable(error: BaseException) -> bool:
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code in _RETRYABLE_STATUSES
+    return isinstance(error, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+
+
+def _http_date(value: str) -> datetime | None:
+    try:
+        date = parsedate_to_datetime(value)
+    except (ValueError, OverflowError):
+        return None
+    return date if date.tzinfo is not None else None
+
+
+def _retry_after(response: httpx.Response) -> float:
+    value = response.headers.get("Retry-After", "").strip()
+    if value.isascii() and value.isdecimal():
+        delay = float(value)
+        return delay if math.isfinite(delay) else 0.0
+    if date := _http_date(value):
+        return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+    return 0.0
 
 
 class StreamDownloader:
@@ -21,76 +56,169 @@ class StreamDownloader:
         self.client: httpx.AsyncClient = httpx.AsyncClient(
             timeout=DOWNLOAD_TIMEOUT, verify=False, proxy=pconfig.cnproxy or None
         )
+        self._cooldown_until: dict[str, float] = {}
 
     async def aclose(self):
         await self.client.aclose()
 
-    SEGMENT_SIZE: int = 10 * 1024 * 1024
-    MAX_CONCURRENT_SEGMENTS: int = 16
-    SEGMENT_DOWNLOAD_THRESHOLD: int = 50 * 1024 * 1024
+    async def _wait_for_cooldown(self, host: str) -> None:
+        loop = asyncio.get_running_loop()
+        # 其他请求可能在等待期间延长冷却时间。
+        while (delay := self._cooldown_until.get(host, 0.0) - loop.time()) > 0:  # noqa: ASYNC110
+            await asyncio.sleep(delay)
+        self._cooldown_until.pop(host, None)
+
+    def _retry_wait(self, host: str, state: RetryCallState) -> float:
+        backoff = 2 ** (state.attempt_number - 1)
+        jitter = random.uniform(0, 1)
+        error = state.outcome.exception() if state.outcome else None
+        if isinstance(error, httpx.HTTPStatusError):
+            response = error.response
+            delay = _retry_after(response)
+            if response.status_code in _RATE_LIMIT_STATUSES:
+                delay = max(delay, 5 * backoff + jitter)
+            if delay > 0:
+                now = asyncio.get_running_loop().time()
+                self._cooldown_until = {key: until for key, until in self._cooldown_until.items() if until > now}
+                response_host = response.url.host
+                for key in {host, response_host}:
+                    self._cooldown_until[key] = max(self._cooldown_until.get(key, 0.0), now + delay)
+                logger.warning(f"下载主机 {response_host} 返回 HTTP {response.status_code}，等待 {delay:.1f} 秒")
+                return 0.0  # 发出下一次请求前统一等待，其他同主机的下载也会等待。
+        return backoff + jitter
 
     @staticmethod
-    def _build_ranges(total_size: int, segment_size: int) -> list[tuple[int, int]]:
-        ranges: list[tuple[int, int]] = []
-        for start in range(0, total_size, segment_size):
-            end = min(start + segment_size - 1, total_size - 1)
-            ranges.append((start, end))
-        return ranges
-
-    @staticmethod
-    def _prepare_target_file(file_path: Path, total_size: int) -> None:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_path.open("wb") as file:
-            file.truncate(total_size)
-
-    @staticmethod
-    def _parse_total_size(content_range: str, existing_size: int = 0) -> int:
-        try:
-            return int(content_range.split("/")[-1])
-        except (ValueError, IndexError):
-            return existing_size
-
-    @staticmethod
-    def _validate_content_length(
-        response: httpx.Response
-    ) -> int:
-        """获取文件长度，返回本次响应的字节长度。"""
-        content_length = response.headers.get("Content-Length")
-        content_length = int(content_length) if content_length else 0
-
-        if content_length == 0:
+    def _validate_size(response: httpx.Response, size: int) -> None:
+        if size <= 0:
             logger.warning(f"媒体 url: {response.url}, 大小为 0, 取消下载")
             raise IgnoreException
 
-        if (file_size := content_length / 1024 / 1024) > pconfig.max_size:
+        if (file_size := size / 1024 / 1024) > pconfig.max_size:
             logger.warning(f"媒体 url: {response.url} 大小 {file_size:.2f} MB, 超过 {pconfig.max_size} MB, 取消下载")
             raise IgnoreException
 
-        return content_length
+    @staticmethod
+    def _resume_validator(response: httpx.Response) -> tuple[str, str] | None:
+        etag = response.headers.get("ETag")
+        if etag is not None:
+            if len(etag) >= 2 and etag.startswith('"') and etag.endswith('"'):
+                return "ETag", etag
+            return None
 
-    @retry(wait=wait_random(1, 2), stop=stop_after_attempt(5))
+        modified = response.headers.get("Last-Modified", "")
+        date = _http_date(response.headers.get("Date", ""))
+        last_modified = _http_date(modified)
+        if date and last_modified and (date - last_modified).total_seconds() >= 60:
+            return "Last-Modified", modified
+        return None
+
+    @staticmethod
+    def _range_bounds(response: httpx.Response, offset: int, total_size: int | None) -> tuple[int, int]:
+        content_range = response.headers.get("Content-Range", "")
+        match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", content_range, re.IGNORECASE)
+        if match:
+            try:
+                start, end, size = map(int, match.groups())
+                length = response.headers.get("Content-Length")
+                if (
+                    start == offset
+                    and start <= end < size
+                    and (total_size is None or total_size == size)
+                    and (length is None or int(length) == end - start + 1)
+                ):
+                    return end + 1, size
+            except ValueError as error:
+                raise httpx.RemoteProtocolError("Invalid range response length", request=response.request) from error
+        raise httpx.RemoteProtocolError("Invalid Content-Range for download resume", request=response.request)
+
+    async def _download_to_file(self, url: str, headers: dict[str, str], file: AsyncBufferedIOBase) -> None:
+        host = httpx.URL(url).host
+        base_headers = httpx.Headers(headers)
+        base_headers["Accept-Encoding"] = "identity"
+        validator: tuple[str, str] | None = None
+        total_size: int | None = None
+        resource_url: httpx.URL | None = None
+
+        async def receive() -> bool:
+            nonlocal validator, total_size, resource_url
+            offset = await file.tell() if validator else 0
+            if offset == total_size:
+                offset = 0
+            request_headers = base_headers.copy()
+            if offset and validator:
+                request_headers["Range"] = f"bytes={offset}-"
+                request_headers["If-Range"] = validator[1]
+
+            await self._wait_for_cooldown(host)
+            async with self.client.stream("GET", url, headers=request_headers, follow_redirects=True) as response:
+                if offset and response.status_code == 416:
+                    validator = None
+                    raise httpx.RemoteProtocolError("Server rejected download resume", request=response.request)
+                response.raise_for_status()
+
+                identity = response.headers.get("Content-Encoding", "identity").strip().lower() == "identity"
+                if response.status_code == 200:
+                    await file.seek(0)
+                    await file.truncate()
+                    offset = 0
+                    length = response.headers.get("Content-Length")
+                    total_size = int(length) if length is not None else None
+                    expected_end = total_size if identity else None
+                    validator = self._resume_validator(response) if identity else None
+                    resource_url = response.url
+                elif response.status_code == 206 and offset and validator:
+                    try:
+                        name, value = validator
+                        if not identity or response.url != resource_url or response.headers.get(name, value) != value:
+                            raise httpx.RemoteProtocolError("Resource changed during resume", request=response.request)
+                        expected_end, total_size = self._range_bounds(response, offset, total_size)
+                    except httpx.RemoteProtocolError:
+                        validator = None
+                        raise
+                else:
+                    raise DownloadException(f"下载收到意外的 HTTP {response.status_code} 响应")
+
+                if total_size is not None:
+                    self._validate_size(response, total_size)
+                async for chunk in response.aiter_bytes():
+                    offset += len(chunk)
+                    self._validate_size(response, offset)
+                    if expected_end is not None and offset > expected_end:
+                        raise DownloadException("下载数据超出响应声明的长度")
+                    await file.write(chunk)
+
+                if expected_end is not None and offset != expected_end:
+                    raise httpx.RemoteProtocolError("Incomplete download response", request=response.request)
+                self._validate_size(response, offset)
+                return response.status_code == 200 or offset == total_size
+
+        async for attempt in AsyncRetrying(
+            retry=retry_if_exception(_is_retryable),
+            wait=partial(self._retry_wait, host),
+            stop=stop_after_attempt(5),
+            reraise=True,
+        ):
+            with attempt:
+                while not await receive():
+                    continue
+                return
+
     async def _download_file_with_httpx(
         self,
         url: str,
         *,
         file_path: Path,
         headers: dict[str, str],
-        chunk_size: int = 64 * 1024,
     ) -> Path:
-        async with self.client.stream(
-            "GET",
-            url,
-            headers=headers,
-            follow_redirects=True,
-        ) as response:
-            response.raise_for_status()
-            self._validate_content_length(response)
-
-            async with aiofiles.open(file_path, "wb") as file:
-                async for chunk in response.aiter_bytes(chunk_size):
-                    await file.write(chunk)
-
-        return file_path
+        part_path = None
+        try:
+            async with NamedTemporaryFile(dir=file_path.parent, suffix=".part", delete=False) as file:
+                part_path = Path(file.name)
+                await self._download_to_file(url, headers, file)
+            return part_path.replace(file_path)
+        finally:
+            if part_path is not None:
+                await safe_unlink(part_path)
 
     async def _download_file(
         self,
@@ -98,7 +226,6 @@ class StreamDownloader:
         *,
         file_name: str | None = None,
         ext_headers: dict[str, str] | None = None,
-        chunk_size: int = 64 * 1024,
     ) -> Path:
         """download file by url with fallback"""
         if not file_name:
@@ -107,9 +234,7 @@ class StreamDownloader:
         headers = {**self.headers, **(ext_headers or {})}
 
         try:
-            path = await self._download_file_with_httpx(
-                url, file_path=file_path, headers=headers, chunk_size=chunk_size
-            )
+            path = await self._download_file_with_httpx(url, file_path=file_path, headers=headers)
         except Exception:
             logger.opt(exception=True).warning(f"下载失败(httpx) | url: {url}")
             raise DownloadException("媒体下载失败")
@@ -132,7 +257,6 @@ class StreamDownloader:
             url,
             file_name=video_name,
             ext_headers=ext_headers,
-            chunk_size=1024 * 1024,
         )
 
     @auto_task
